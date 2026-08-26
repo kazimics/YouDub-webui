@@ -21,6 +21,8 @@ _PROMPT_CACHE_GENERATION_DEFAULTS = {
     "retry_badcase_ratio_threshold": 6.0,
 }
 
+PREFERRED_REFERENCE_MS = 5000
+
 
 def _model_path() -> Path:
     configured_dir = os.getenv("VOXCPM_MODEL_DIR")
@@ -47,13 +49,16 @@ def _load_model():
     return _MODEL
 
 
-def _first_reference(files: list[Path], min_ms: int) -> Path | None:
+def _select_reference(files: list[Path], preferred_ms: int, min_ms: int) -> Path | None:
+    if not files:
+        return None
+    for path in files:
+        if len(AudioSegment.from_file(path)) >= preferred_ms:
+            return path
     for path in files:
         if len(AudioSegment.from_file(path)) >= min_ms:
             return path
-    if files:
-        return files[0]
-    return None
+    return files[0]
 
 
 def _speaker(item: dict) -> str:
@@ -64,12 +69,14 @@ def _speaker(item: dict) -> str:
     return speaker or "1"
 
 
-def _fallback_references(vocals_dir: Path, items: list[dict], min_ms: int) -> tuple[dict[str, Path], Path]:
+def _fallback_references(
+    vocals_dir: Path, items: list[dict], min_ms: int, preferred_ms: int
+) -> tuple[dict[str, Path], Path]:
     files = sorted(vocals_dir.glob("*.wav"))
     if not files:
         raise FileNotFoundError("No vocal segments were generated for VoxCPM references.")
 
-    global_fallback = _first_reference(files, min_ms) or files[0]
+    global_fallback = _select_reference(files, preferred_ms, min_ms) or files[0]
     speaker_files: dict[str, list[Path]] = {}
     for index, item in enumerate(items, start=1):
         reference = vocals_dir / f"{index:04d}.wav"
@@ -78,7 +85,7 @@ def _fallback_references(vocals_dir: Path, items: list[dict], min_ms: int) -> tu
 
     fallbacks: dict[str, Path] = {}
     for speaker, refs in speaker_files.items():
-        fallback = _first_reference(refs, min_ms)
+        fallback = _select_reference(refs, preferred_ms, min_ms)
         if fallback is not None:
             fallbacks[speaker] = fallback
 
@@ -111,40 +118,34 @@ def generate_tts(
 
     model = _load_model()
     min_reference_ms = int(os.getenv("VOXCPM_MIN_REFERENCE_MS", "1200"))
-    fallback_references, global_fallback = _fallback_references(vocals_dir, items, min_reference_ms)
+    preferred_reference_ms = max(min_reference_ms, PREFERRED_REFERENCE_MS)
+    speaker_references, global_reference = _fallback_references(
+        vocals_dir, items, min_reference_ms, preferred_reference_ms
+    )
     cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))
     inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
-    fallback_caches = {}
+    speaker_caches = {}
 
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
         if not output_file.exists():
-            reference = vocals_dir / f"{index:04d}.wav"
             text = _tts_text(item)
-            if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
-                speaker = _speaker(item)
-                if speaker not in fallback_caches:
-                    fallback = fallback_references.get(speaker, global_fallback)
-                    fallback_caches[speaker] = model.tts_model.build_prompt_cache(
-                        reference_wav_path=str(fallback)
-                    )
-                result = model.tts_model.generate_with_prompt_cache(
-                    target_text=text,
-                    prompt_cache=fallback_caches[speaker],
-                    cfg_value=cfg_value,
-                    inference_timesteps=inference_timesteps,
-                    **_PROMPT_CACHE_GENERATION_DEFAULTS,
+            speaker = _speaker(item)
+            if speaker not in speaker_caches:
+                reference = speaker_references.get(speaker, global_reference)
+                speaker_caches[speaker] = model.tts_model.build_prompt_cache(
+                    reference_wav_path=str(reference)
                 )
-                wav_tensor, _, _ = result
-                wav = wav_tensor.squeeze(0).cpu().numpy()
-            else:
-                wav = model.generate(
-                    text=text,
-                    reference_wav_path=str(reference),
-                    cfg_value=cfg_value,
-                    inference_timesteps=inference_timesteps,
-                )
+            result = model.tts_model.generate_with_prompt_cache(
+                target_text=text,
+                prompt_cache=speaker_caches[speaker],
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
+                **_PROMPT_CACHE_GENERATION_DEFAULTS,
+            )
+            wav_tensor, _, _ = result
+            wav = wav_tensor.squeeze(0).cpu().numpy()
             sf.write(output_file, wav, model.tts_model.sample_rate)
         if progress_callback:
             progress = round(index / total * 100)
